@@ -16,7 +16,7 @@ With Yarn:
 ```bash
 $ yarn create vite
 ```
-
+.
 With PNPM:
 
 ```bash
