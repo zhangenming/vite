@@ -1,4 +1,4 @@
-// eslint-disable-next-line import/no-nodejs-modules
+// eslint-disable-next-line import-x/no-nodejs-modules
 import { URL } from 'url'
 import { defineConfig } from 'vite'
 
@@ -8,11 +8,11 @@ globalThis.__test_url = URL
 
 export default defineConfig({
   server: {
-    host: 'localhost'
+    host: 'localhost',
   },
   build: {
     //speed up build
     minify: false,
-    target: 'esnext'
-  }
+    target: 'esnext',
+  },
 })

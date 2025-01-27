@@ -1,15 +1,12 @@
-import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
-import type {
-  Server as HttpServer,
-  OutgoingHttpHeaders as HttpServerHeaders
-} from 'node:http'
+import type { OutgoingHttpHeaders as HttpServerHeaders } from 'node:http'
 import type { ServerOptions as HttpsServerOptions } from 'node:https'
 import type { Connect } from 'dep-types/connect'
 import colors from 'picocolors'
-import { isObject } from './utils'
 import type { ProxyOptions } from './server/middlewares/proxy'
 import type { Logger } from './logger'
+import type { HttpServer } from './server'
 
 export interface CommonServerOptions {
   /**
@@ -28,10 +25,22 @@ export interface CommonServerOptions {
    */
   host?: string | boolean
   /**
+   * The hostnames that Vite is allowed to respond to.
+   * `localhost` and subdomains under `.localhost` and all IP addresses are allowed by default.
+   * When using HTTPS, this check is skipped.
+   *
+   * If a string starts with `.`, it will allow that hostname without the `.` and all subdomains under the hostname.
+   * For example, `.example.com` will allow `example.com`, `foo.example.com`, and `foo.bar.example.com`.
+   *
+   * If set to `true`, the server is allowed to respond to requests for any hosts.
+   * This is not recommended as it will be vulnerable to DNS rebinding attacks.
+   */
+  allowedHosts?: string[] | true
+  /**
    * Enable TLS + HTTP/2.
    * Note: this downgrades to TLS only when the proxy option is also used.
    */
-  https?: boolean | HttpsServerOptions
+  https?: HttpsServerOptions
   /**
    * Open browser window on startup
    */
@@ -46,8 +55,8 @@ export interface CommonServerOptions {
    * ``` js
    * module.exports = {
    *   proxy: {
-   *     // string shorthand
-   *     '/foo': 'http://localhost:4567/foo',
+   *     // string shorthand: /foo -> http://localhost:4567/foo
+   *     '/foo': 'http://localhost:4567',
    *     // with options
    *     '/api': {
    *       target: 'http://jsonplaceholder.typicode.com',
@@ -62,8 +71,14 @@ export interface CommonServerOptions {
   /**
    * Configure CORS for the dev server.
    * Uses https://github.com/expressjs/cors.
+   *
+   * When enabling this option, **we recommend setting a specific value
+   * rather than `true`** to avoid exposing the source code to untrusted origins.
+   *
    * Set to `true` to allow all methods from any origin, or configure separately
    * using an object.
+   *
+   * @default false
    */
   cors?: CorsOptions | boolean
   /**
@@ -76,9 +91,18 @@ export interface CommonServerOptions {
  * https://github.com/expressjs/cors#configuration-options
  */
 export interface CorsOptions {
+  /**
+   * Configures the Access-Control-Allow-Origin CORS header.
+   *
+   * **We recommend setting a specific value rather than
+   * `true`** to avoid exposing the source code to untrusted origins.
+   */
   origin?:
     | CorsOrigin
-    | ((origin: string, cb: (err: Error, origins: CorsOrigin) => void) => void)
+    | ((
+        origin: string | undefined,
+        cb: (err: Error, origins: CorsOrigin) => void,
+      ) => void)
   methods?: string | string[]
   allowedHeaders?: string | string[]
   exposedHeaders?: string | string[]
@@ -93,7 +117,7 @@ export type CorsOrigin = boolean | string | RegExp | (string | RegExp)[]
 export async function resolveHttpServer(
   { proxy }: CommonServerOptions,
   app: Connect.Server,
-  httpsOptions?: HttpsServerOptions
+  httpsOptions?: HttpsServerOptions,
 ): Promise<HttpServer> {
   if (!httpsOptions) {
     const { createServer } = await import('node:http')
@@ -112,38 +136,31 @@ export async function resolveHttpServer(
         // errors on large numbers of requests
         maxSessionMemory: 1000,
         ...httpsOptions,
-        allowHTTP1: true
+        allowHTTP1: true,
       },
       // @ts-expect-error TODO: is this correct?
-      app
-    ) as unknown as HttpServer
+      app,
+    )
   }
 }
 
 export async function resolveHttpsConfig(
-  https: boolean | HttpsServerOptions | undefined
+  https: HttpsServerOptions | undefined,
 ): Promise<HttpsServerOptions | undefined> {
   if (!https) return undefined
 
-  const httpsOption = isObject(https) ? { ...https } : {}
-
-  const { ca, cert, key, pfx } = httpsOption
-  Object.assign(httpsOption, {
-    ca: readFileIfExists(ca),
-    cert: readFileIfExists(cert),
-    key: readFileIfExists(key),
-    pfx: readFileIfExists(pfx)
-  })
-  return httpsOption
+  const [ca, cert, key, pfx] = await Promise.all([
+    readFileIfExists(https.ca),
+    readFileIfExists(https.cert),
+    readFileIfExists(https.key),
+    readFileIfExists(https.pfx),
+  ])
+  return { ...https, ca, cert, key, pfx }
 }
 
-function readFileIfExists(value?: string | Buffer | any[]) {
+async function readFileIfExists(value?: string | Buffer | any[]) {
   if (typeof value === 'string') {
-    try {
-      return fs.readFileSync(path.resolve(value))
-    } catch (e) {
-      return value
-    }
+    return fsp.readFile(path.resolve(value)).catch(() => value)
   }
   return value
 }
@@ -155,7 +172,7 @@ export async function httpServerStart(
     strictPort: boolean | undefined
     host: string | undefined
     logger: Logger
-  }
+  },
 ): Promise<number> {
   let { port, strictPort, host, logger } = serverOptions
 
@@ -186,7 +203,7 @@ export async function httpServerStart(
 
 export function setClientErrorHandler(
   server: HttpServer,
-  logger: Logger
+  logger: Logger,
 ): void {
   server.on('clientError', (err, socket) => {
     let msg = '400 Bad Request'
@@ -195,8 +212,8 @@ export function setClientErrorHandler(
       logger.warn(
         colors.yellow(
           'Server responded with status code 431. ' +
-            'See https://vitejs.dev/guide/troubleshooting.html#_431-request-header-fields-too-large.'
-        )
+            'See https://vite.dev/guide/troubleshooting.html#_431-request-header-fields-too-large.',
+        ),
       )
     }
     if ((err as any).code === 'ECONNRESET' || !socket.writable) {

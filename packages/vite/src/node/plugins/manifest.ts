@@ -1,10 +1,16 @@
 import path from 'node:path'
-import type { OutputAsset, OutputChunk } from 'rollup'
-import type { ResolvedConfig } from '..'
+import type {
+  InternalModuleFormat,
+  OutputAsset,
+  OutputChunk,
+  RenderedChunk,
+} from 'rollup'
 import type { Plugin } from '../plugin'
-import { normalizePath } from '../utils'
-import { cssEntryFilesCache } from './css'
-import { duplicateAssets } from './asset'
+import { normalizePath, sortObjectKeys } from '../utils'
+import { perEnvironmentState } from '../environment'
+import { cssEntriesMap } from './asset'
+
+const endsWithJSRE = /\.[cm]?js$/
 
 export type Manifest = Record<string, ManifestChunk>
 
@@ -14,38 +20,47 @@ export interface ManifestChunk {
   css?: string[]
   assets?: string[]
   isEntry?: boolean
+  name?: string
   isDynamicEntry?: boolean
   imports?: string[]
   dynamicImports?: string[]
 }
 
-export function manifestPlugin(config: ResolvedConfig): Plugin {
-  const manifest: Manifest = {}
-
-  let outputCount: number
+export function manifestPlugin(): Plugin {
+  const getState = perEnvironmentState(() => {
+    return {
+      manifest: {} as Manifest,
+      outputCount: 0,
+      reset() {
+        this.outputCount = 0
+      },
+    }
+  })
 
   return {
     name: 'vite:manifest',
 
+    perEnvironmentStartEndDuringDev: true,
+
+    applyToEnvironment(environment) {
+      return !!environment.config.build.manifest
+    },
+
     buildStart() {
-      outputCount = 0
+      getState(this).reset()
     },
 
     generateBundle({ format }, bundle) {
+      const state = getState(this)
+      const { manifest } = state
+      const { root } = this.environment.config
+      const buildOptions = this.environment.config.build
+
       function getChunkName(chunk: OutputChunk) {
-        if (chunk.facadeModuleId) {
-          let name = normalizePath(
-            path.relative(config.root, chunk.facadeModuleId)
-          )
-          if (format === 'system' && !chunk.name.includes('-legacy')) {
-            const ext = path.extname(name)
-            const endPos = ext.length !== 0 ? -ext.length : undefined
-            name = name.slice(0, endPos) + `-legacy` + ext
-          }
-          return name.replace(/\0/g, '')
-        } else {
-          return `_` + path.basename(chunk.fileName)
-        }
+        return (
+          getChunkOriginalFileName(chunk, root, format) ??
+          `_${path.basename(chunk.fileName)}`
+        )
       }
 
       function getInternalImports(imports: string[]): string[] {
@@ -64,7 +79,8 @@ export function manifestPlugin(config: ResolvedConfig): Plugin {
 
       function createChunk(chunk: OutputChunk): ManifestChunk {
         const manifestChunk: ManifestChunk = {
-          file: chunk.fileName
+          file: chunk.fileName,
+          name: chunk.name,
         }
 
         if (chunk.facadeModuleId) {
@@ -91,56 +107,99 @@ export function manifestPlugin(config: ResolvedConfig): Plugin {
           }
         }
 
-        if (chunk.viteMetadata.importedCss.size) {
+        if (chunk.viteMetadata?.importedCss.size) {
           manifestChunk.css = [...chunk.viteMetadata.importedCss]
         }
-        if (chunk.viteMetadata.importedAssets.size) {
+        if (chunk.viteMetadata?.importedAssets.size) {
           manifestChunk.assets = [...chunk.viteMetadata.importedAssets]
         }
 
         return manifestChunk
       }
 
-      function createAsset(chunk: OutputAsset): ManifestChunk {
+      function createAsset(
+        asset: OutputAsset,
+        src: string,
+        isEntry?: boolean,
+      ): ManifestChunk {
         const manifestChunk: ManifestChunk = {
-          file: chunk.fileName,
-          src: chunk.name
+          file: asset.fileName,
+          src,
         }
-
-        if (cssEntryFiles.has(chunk.name!)) manifestChunk.isEntry = true
-
+        if (isEntry) manifestChunk.isEntry = true
         return manifestChunk
       }
 
-      const cssEntryFiles = cssEntryFilesCache.get(config)!
+      const entryCssReferenceIds = cssEntriesMap.get(this.environment)!
+      const entryCssAssetFileNames = new Set(entryCssReferenceIds)
+      for (const id of entryCssReferenceIds) {
+        try {
+          const fileName = this.getFileName(id)
+          entryCssAssetFileNames.add(fileName)
+        } catch {
+          // The asset was generated as part of a different output option.
+          // It was already handled during the previous run of this plugin.
+        }
+      }
 
       for (const file in bundle) {
         const chunk = bundle[file]
         if (chunk.type === 'chunk') {
           manifest[getChunkName(chunk)] = createChunk(chunk)
-        } else if (chunk.type === 'asset' && typeof chunk.name === 'string') {
-          manifest[chunk.name] = createAsset(chunk)
+        } else if (chunk.type === 'asset' && chunk.names.length > 0) {
+          // Add every unique asset to the manifest, keyed by its original name
+          const src =
+            chunk.originalFileNames.length > 0
+              ? chunk.originalFileNames[0]
+              : `_${path.basename(chunk.fileName)}`
+          const isEntry = entryCssAssetFileNames.has(chunk.fileName)
+          const asset = createAsset(chunk, src, isEntry)
+
+          // If JS chunk and asset chunk are both generated from the same source file,
+          // prioritize JS chunk as it contains more information
+          const file = manifest[src]?.file
+          if (!(file && endsWithJSRE.test(file))) {
+            manifest[src] = asset
+          }
+
+          for (const originalFileName of chunk.originalFileNames.slice(1)) {
+            const file = manifest[originalFileName]?.file
+            if (!(file && endsWithJSRE.test(file))) {
+              manifest[originalFileName] = asset
+            }
+          }
         }
       }
 
-      duplicateAssets.get(config)!.forEach((asset) => {
-        const chunk = createAsset(asset)
-        manifest[asset.name!] = chunk
-      })
-
-      outputCount++
-      const output = config.build.rollupOptions?.output
+      state.outputCount++
+      const output = buildOptions.rollupOptions.output
       const outputLength = Array.isArray(output) ? output.length : 1
-      if (outputCount >= outputLength) {
+      if (state.outputCount >= outputLength) {
         this.emitFile({
           fileName:
-            typeof config.build.manifest === 'string'
-              ? config.build.manifest
-              : 'manifest.json',
+            typeof buildOptions.manifest === 'string'
+              ? buildOptions.manifest
+              : '.vite/manifest.json',
           type: 'asset',
-          source: JSON.stringify(manifest, null, 2)
+          source: JSON.stringify(sortObjectKeys(manifest), undefined, 2),
         })
       }
+    },
+  }
+}
+
+export function getChunkOriginalFileName(
+  chunk: OutputChunk | RenderedChunk,
+  root: string,
+  format: InternalModuleFormat,
+): string | undefined {
+  if (chunk.facadeModuleId) {
+    let name = normalizePath(path.relative(root, chunk.facadeModuleId))
+    if (format === 'system' && !chunk.name.includes('-legacy')) {
+      const ext = path.extname(name)
+      const endPos = ext.length !== 0 ? -ext.length : undefined
+      name = `${name.slice(0, endPos)}-legacy${ext}`
     }
+    return name.replace(/\0/g, '')
   }
 }

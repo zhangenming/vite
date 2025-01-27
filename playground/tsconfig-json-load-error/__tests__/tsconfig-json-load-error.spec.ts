@@ -7,15 +7,16 @@ import {
   isServe,
   page,
   readFile,
-  untilUpdated
+  untilUpdated,
 } from '~utils'
+
+const unexpectedTokenSyntaxErrorRE =
+  /(\[vite:esbuild\] )*parsing .* failed: SyntaxError: Unexpected token.*\}.*/
 
 describe.runIf(isBuild)('build', () => {
   test('should throw an error on build', () => {
     expect(serveError).toBeTruthy()
-    expect(serveError.message).toMatch(
-      /^parsing .* failed: SyntaxError: Unexpected token } in JSON at position \d+$/
-    )
+    expect(serveError.message).toMatch(unexpectedTokenSyntaxErrorRE)
     clearServeError() // got expected error, null it here so testsuite does not fail from rethrow in afterAll
   })
 
@@ -45,13 +46,11 @@ describe.runIf(isServe)('server', () => {
       return m[0].innerHTML
     })
     // use regex with variable filename and position values because they are different on win
-    expect(message).toMatch(
-      /^parsing .* failed: SyntaxError: Unexpected token } in JSON at position \d+$/
-    )
+    expect(message).toMatch(unexpectedTokenSyntaxErrorRE)
   })
 
   test('should reload when tsconfig is changed', async () => {
-    await editFile('has-error/tsconfig.json', (content) => {
+    editFile('has-error/tsconfig.json', (content) => {
       return content.replace('"compilerOptions":', '"compilerOptions":{}')
     })
     await untilUpdated(() => {
