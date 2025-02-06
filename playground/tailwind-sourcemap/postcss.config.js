@@ -1,7 +1,6 @@
-console.log(__dirname + '/tailwind.config.js')
-
-module.exports = {
+export default {
   plugins: {
-    tailwindcss: { config: __dirname + '/tailwind.config.js' }
-  }
+    // using postcss tailwind as we want to test postcss integration
+    '@tailwindcss/postcss': {},
+  },
 }
